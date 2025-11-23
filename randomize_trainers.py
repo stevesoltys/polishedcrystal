@@ -5,25 +5,49 @@ import argparse
 from collections import namedtuple, defaultdict
 
 # A structure to hold the data for a single Pokémon entry.
-# 'level' is stored separately from the rest of the definition line.
 PokemonData = namedtuple('PokemonData', ['level', 'species_and_data', 'moves_line'])
+
+# A generic pool key for all Pokémon that do not have moves defined in their schema.
+NO_MOVES_POOL_KEY = 'NO_MOVES_POOL'
+
+def get_pokemon_list(constants_file):
+    """
+    Parses the pokemon_constants.asm file to get a list of all Pokémon.
+    It excludes special entries like UNOWN, EGG, and TERU_SAMA.
+    """
+    pokemon_list = []
+    # This regex is designed to find lines like:
+    # const MEW          ; 151
+    # and extract "MEW". It ensures the name starts with a letter.
+    pokemon_regex = re.compile(r'^\s*const\s+([A-Z][A-Z_0-9]*)\s+;.*')
+    
+    # These are not real Pokémon that should appear in the wild.
+    blacklist = {"NO_POKEMON", "UNOWN", "EGG", "TERU_SAMA"}
+
+    try:
+        with open(constants_file, 'r') as f:
+            for line in f:
+                match = pokemon_regex.match(line)
+                if match:
+                    pokemon_name = match.group(1)
+                    if pokemon_name not in blacklist:
+                        pokemon_list.append(pokemon_name)
+    except FileNotFoundError:
+        print(f"Error: The file {constants_file} was not found.")
+        return None
+    return pokemon_list
 
 def parse_trainer_parties(lines):
     """
     Parses the trainer parties file to extract all Pokémon data.
-    It groups Pokémon into pools based on their schema (the TRAINERTYPE flags).
-
-    Returns a dictionary of pools: {schema_string: [PokemonData, ...]}
+    It groups Pokémon into pools. If a Pokémon's schema does not include moves,
+    it is added to a large, generic pool. Otherwise, it is pooled with other
+    Pokémon sharing the exact same schema.
     """
     pools = defaultdict(list)
 
-    # Regex to identify a trainer's schema definition line.
     schema_regex = re.compile(r'^\s*db\s+((?:TRAINERTYPE_\w+\s*(?:\|\s*)?)+)\s*')
-    # Regex to identify and capture parts of a Pokémon definition line.
-    # Group 1: The level (e.g., '45')
-    # Group 2: The rest of the line, including species and optional data (e.g., ', KINGLER, KINGS_ROCK')
     pokemon_line_regex = re.compile(r'^\s*db\s+(\d+)(,\s*[A-Z][A-Z_0-9]*.*)')
-    # Regex to identify a line defining moves.
     moves_line_regex = re.compile(r'^\s*db\s+[A-Z_0-9]+,\s*[A-Z_0-9]+.*')
 
     current_schema = None
@@ -31,16 +55,13 @@ def parse_trainer_parties(lines):
     while i < len(lines):
         line = lines[i]
 
-        # Find the schema for the current trainer party.
         schema_match = schema_regex.match(line)
         if schema_match:
             current_schema = schema_match.group(1).strip()
 
-        # If we have a schema and find a Pokémon, parse it.
         poke_match = pokemon_line_regex.match(line)
         if poke_match:
             if not current_schema:
-                # This can happen for malformed entries; we'll skip them.
                 i += 1
                 continue
 
@@ -48,46 +69,46 @@ def parse_trainer_parties(lines):
             species_and_data = poke_match.group(2)
             moves_line = None
 
-            # If the schema includes moves, look for the corresponding moves line.
             if 'TRAINERTYPE_MOVES' in current_schema:
-                # Look ahead for the moves line, skipping any comments.
+                pool_key = current_schema
                 j = i + 1
                 while j < len(lines) and lines[j].strip().startswith(';'):
                     j += 1
-
                 if j < len(lines) and moves_line_regex.match(lines[j]):
                     moves_line = lines[j]
-                    i = j  # Move the main index past the moves line we just consumed.
+                    i = j
+            else:
+                pool_key = NO_MOVES_POOL_KEY
 
-            # Add the parsed Pokémon to the appropriate pool based on its schema.
-            pools[current_schema].append(PokemonData(level, species_and_data, moves_line))
-
+            pools[pool_key].append(PokemonData(level, species_and_data, moves_line))
         i += 1
-
     return pools
 
-def randomize_and_rebuild(pools, original_lines, output_filepath):
+def randomize_and_rebuild(pools, pokemon_list, original_lines, output_filepath):
     """
-    Rebuilds the trainer party file using the shuffled Pokémon pools,
-    while preserving the original levels for each slot.
+    Rebuilds the trainer party file using shuffled Pokémon pools.
+    For trainers with move-based schemas, it shuffles their existing Pokémon.
+    For trainers without moves, it replaces their Pokémon with random ones
+    from the full list, preserving levels and items.
     """
     if not pools:
         print("No Pokémon found in trainer parties. Nothing to randomize.")
         return
 
-    # Shuffle each pool of Pokémon independently.
-    shuffled_pools = {schema: random.sample(pokemon_list, len(pokemon_list))
-                      for schema, pokemon_list in pools.items()}
+    # Shuffle pools for schemas that include moves.
+    shuffled_pools_with_moves = {
+        schema: random.sample(p_list, len(p_list))
+        for schema, p_list in pools.items() if schema != NO_MOVES_POOL_KEY
+    }
+    pool_counters = {schema: 0 for schema in shuffled_pools_with_moves}
 
-    # Keep track of how many Pokémon from each pool we've used so far.
-    pool_counters = {schema: 0 for schema in pools}
-
-    for schema, pokemon_list in pools.items():
-        print(f"Found and shuffled {len(pokemon_list)} Pokémon for schema: {schema}")
+    for schema, p_list in shuffled_pools_with_moves.items():
+        print(f"Found and shuffled {len(p_list)} Pokémon for schema: {schema}")
+    if NO_MOVES_POOL_KEY in pools:
+        count = len(pools[NO_MOVES_POOL_KEY])
+        print(f"Found {count} Pokémon slots in the generic (no-moves) pool. They will be filled from the full Pokémon list.")
 
     new_lines = []
-
-    # Regexes to find the lines we need to replace or skip.
     schema_regex = re.compile(r'^\s*db\s+((?:TRAINERTYPE_\w+\s*(?:\|\s*)?)+)\s*')
     pokemon_line_regex = re.compile(r'^\s*db\s+(\d+)(,\s*[A-Z][A-Z_0-9]*.*)')
     moves_line_regex = re.compile(r'^\s*db\s+[A-Z_0-9]+,\s*[A-Z_0-9]+.*')
@@ -97,54 +118,55 @@ def randomize_and_rebuild(pools, original_lines, output_filepath):
     while i < len(original_lines):
         line = original_lines[i]
 
-        # Update the current schema when we find a new trainer definition.
         schema_match = schema_regex.match(line)
         if schema_match:
             current_schema = schema_match.group(1).strip()
 
-        # If it's a Pokémon line, replace it with a shuffled one from the correct pool.
         poke_match = pokemon_line_regex.match(line)
-        if poke_match:
-            if current_schema and current_schema in shuffled_pools:
-                pool_idx = pool_counters[current_schema]
-                if pool_idx < len(shuffled_pools[current_schema]):
-                    # Get the original level from the current line.
-                    original_level = poke_match.group(1)
+        if poke_match and current_schema:
+            original_level = poke_match.group(1)
+            indentation = re.match(r'(\s*)', line).group(1)
 
-                    # Get the next shuffled Pokémon "template" from the correct pool.
-                    new_pokemon_template = shuffled_pools[current_schema][pool_idx]
-                    pool_counters[current_schema] += 1
+            if 'TRAINERTYPE_MOVES' in current_schema:
+                pool_key = current_schema
+                if pool_key in shuffled_pools_with_moves:
+                    pool_idx = pool_counters[pool_key]
+                    if pool_idx < len(shuffled_pools_with_moves[pool_key]):
+                        template = shuffled_pools_with_moves[pool_key][pool_idx]
+                        pool_counters[pool_key] += 1
 
-                    # Reconstruct the Pokémon line with the original level and the new species/data.
-                    # We need to preserve the original indentation.
-                    indentation = re.match(r'(\s*)', line).group(1)
-                    new_pokemon_line = f"{indentation}db {original_level}{new_pokemon_template.species_and_data}\n"
+                        new_pokemon_line = f"{indentation}db {original_level}{template.species_and_data}\n"
+                        new_lines.append(new_pokemon_line)
+                        if template.moves_line:
+                            new_lines.append(template.moves_line)
 
-                    # Add the new Pokémon's data to our output.
-                    new_lines.append(new_pokemon_line)
-                    if new_pokemon_template.moves_line:
-                        new_lines.append(new_pokemon_template.moves_line)
-
-                    # If the original Pokémon had moves, we must skip its moves line in the input.
-                    if 'TRAINERTYPE_MOVES' in current_schema:
                         j = i + 1
                         while j < len(original_lines) and original_lines[j].strip().startswith(';'):
                             j += 1
                         if j < len(original_lines) and moves_line_regex.match(original_lines[j]):
-                            i = j  # Skip the original moves line.
+                            i = j
+                    else:
+                        new_lines.append(line)
                 else:
-                    # This case should not be reached with correct parsing.
                     new_lines.append(line)
             else:
-                # Keep the line if it's a Pokémon without a recognized schema.
-                new_lines.append(line)
+                if pokemon_list:
+                    new_species = random.choice(pokemon_list)
+                    original_species_and_data = poke_match.group(2)
+                    parts = original_species_and_data.split(',')
+                    new_species_and_data = f", {new_species}"
+                    if len(parts) > 2:  # Has an item
+                        item = parts[2].strip()
+                        new_species_and_data += f", {item}"
+                    
+                    new_pokemon_line = f"{indentation}db {original_level}{new_species_and_data}\n"
+                    new_lines.append(new_pokemon_line)
+                else:
+                    new_lines.append(line)
         else:
-            # This line is not a Pokémon definition, so keep it as is.
             new_lines.append(line)
-
         i += 1
 
-    # Write the new content to the file, preserving original line endings.
     try:
         with open(output_filepath, 'w', newline='') as f:
             f.writelines(new_lines)
@@ -167,6 +189,7 @@ def main():
 
     project_path = args.path
     parties_file = os.path.join(project_path, 'data', 'trainers', 'parties.asm')
+    constants_file = os.path.join(project_path, 'constants', 'pokemon_constants.asm')
 
     print("Starting trainer Pokémon randomization process...")
 
@@ -177,14 +200,16 @@ def main():
         print(f"Error: Trainer parties file not found at '{parties_file}'")
         return
 
-    # Parse the file to get all Pokémon grouped by schema.
     pools = parse_trainer_parties(original_lines)
+    pokemon_list = get_pokemon_list(constants_file)
+
+    if not pokemon_list:
+        print("Could not generate a Pokémon list. Aborting randomization for no-moves trainers.")
 
     if pools:
-        # Randomize and write back to the same file.
-        randomize_and_rebuild(pools, original_lines, parties_file)
+        randomize_and_rebuild(pools, pokemon_list, original_lines, parties_file)
         print("\nRandomization complete!")
-        print("Trainer parties have been updated while preserving original levels.")
+        print("Trainer parties have been updated.")
 
 if __name__ == '__main__':
     main()
